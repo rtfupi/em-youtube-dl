@@ -1,0 +1,538 @@
+#!/bin/sh
+
+##.###########################################################################.
+##! Copyright (C) Марков Евгений 2020
+##!
+##! \file   em-youtube-dl
+##! \author Марков Евгений <mark@mail.utis.lan>
+##! \date   2020-06-14 20:46
+##!
+##! \brief  Watch videos from youtube using mlayer.
+##|
+##'###########################################################################'
+
+
+# https://askubuntu.ru/questions/46026/kak-vy-brat-kachestvo-video-s-youtube-dl
+
+#logger -p local2.info -t `basename $0` "><"
+
+# Download youtube video with desired quality
+# youtube-dl accepts both fully qualified URLs and video id's such as AQcQgfvfF1M
+
+SN=`basename $0`
+export SN
+
+
+##.=======================================================================.
+##! \brief Information about arguments.
+##|
+##'======================================================================='
+help_message ()
+{
+    cat << EOF
+
+   ${SN} --help|-h
+   ${SN} [--win|-w] [[--format|-f <N>]|[--interact|-i]]
+           [--save|-s|--save-default] <URL>
+   ${SN} [--win|-w] [[--format|-f <N>]|[--interact|-i]]
+           [--no-play|-N] <URL>
+   ${SN} [--win|-w] [[--format|-f <N>]|[--interact|-i]]
+           [--save|-s|--save-default] --use-xsel|-x
+   ${SN} [--win|-w] [[--format|-f <N>]|[--interact|-i]] [--no-play|-N]
+            --use-xsel|-x
+
+   Examles:
+
+   Run mpv to view the url in 18 format (mp4:640x360):
+   $ em-youtube-dl YOUTUBE-URL
+
+   Run mpv to view the url in 22 format (mp4:1280x720):
+   $ em-youtube-dl -format 22 YOUTUBE-URL
+
+   Run mpv to view the url in 18 format (mp4:640x360), url to copy from
+   clipboard (need xsel):
+   $ em-youtube-dl -x YOUTUBE-URL
+
+   Save to file (with default name) and run mpv to view the url (will be
+   loaded with two parallel streams for viewing and saving):   
+   $ em-youtube-dl --save-default YOUTUBE-URL
+
+   Save to file (with default name) and run mpv after it to view the
+   saved file:   
+   $ em-youtube-dl --save-then-play YOUTUBE-URL
+
+   Save to file (with default name) video:   
+   $ em-youtube-dl --save-default -N YOUTUBE-URL
+
+Options:
+
+  --save|-s       - save video to file;
+  --save-default  - save video to file with default name;
+  --save-wait     - save video to file (wait for confirmation);
+  --save-default-wait - save video to file with default name
+                        (wait for confirmation);
+  --save-then-play    - always run video from saved file
+                        (implies --save-default, if one of
+                         -save... is missing);
+
+  --dir|-d        - directory path where the video is saved;
+  --no-play|-N    - no play stream;
+  --use-xsel|-x   - use xsel to copy (need xsel);
+  --win|-w        - call a new terminal window for input;
+  --format|-f <N> - preferred video format (default 18);
+  --interact|-i   - interactive format selection;
+  --above|-A      - mpv always on top (need wmctrl);
+  --sticky|-S     - mpv alwiys on visible workspace (need wmctrl);
+  --help,-h       - this message.
+EOF
+
+    return 0
+}
+
+
+##.=======================================================================.
+##! \brief Transit of SIGQUIT signal event via pipe.
+##!
+##! \param $1 - path to named pipe or variable name.
+##|
+##'======================================================================='
+em_send_quit () {
+    printf '\nAborting\n'
+    sleep 1
+    if [ -p "${1}" ];then
+        echo 'signal://SIGQUIT' > "${1}"
+    else
+        eval "${1}='signal://SIGQUIT'"
+    fi
+}
+export -f em_send_quit
+
+
+##.=======================================================================.
+##! \brief Save video to file.
+##!
+##! \param $1 - video format;
+##! \param $2 - page url;
+##! \param $3 - save mode;
+##! \param $4 - path to named pipe or variable name.
+##|
+##'======================================================================='
+em_save_video2file () {
+
+    local filename_full
+    local filename
+    local d=$(date "+%Y%m%d%H%M%S")
+    local rcode=0
+    local f
+    # local rchar
+
+    filename_full="$(youtube-dl --get-filename -f ${1} "${2}")"
+    filename="$(youtube-dl --get-filename --restrict-filenames -f ${1} "${2}")"
+
+    #echo "${filename_full}" > "${d}.fullname"
+    #filename_full="${d}"."${filename_full}"
+    #filename="${d}"."$(youtube-dl --get-filename --restrict-filenames -f ${1} "${2}")"
+
+
+    if [ y${3} = yyes ] || [ w${3} = wwait ];then
+        # для опций --save и --save-wait можем изменить имя сохран. файла.
+        echo "File name accept(Enter)/reset(Esc):"
+        read -e -p '' -i "${filename}"
+        if [ $? = 1 ];then em_send_quit "${4}"; return 1;fi # получен Ctrl-D
+        if [ -n "${REPLY}" ];then filename="${REPLY}"; fi
+    fi
+
+    if [ -f "${filename}" ];then
+        # такой файл уже существует: будем заменять, заменять и backap-ть,
+        # воспроизводить или ничего не делать.
+        echo "A file named '${filename}' already exists. Actions?"
+        read -n 1 -p "([n]o / [r]eplace / [b]ackup / [p]lay): " 
+        if [ "$(printf "%d" "'$REPLY")" = 4 ];then
+            em_send_quit "${4}";return 1 # получен Ctrl-D
+        fi
+        echo ''
+
+        f="$(echo "${filename}"|rev|cut -f 2- -d '.'|rev)"
+        # rchar="${REPLY}"
+        case "${REPLY}" in
+            r|R) rm -f "${filename}"
+                 rm -f "${f}.description"
+                 rm -f "${filename}.fullname"
+                 echo "${filename_full}" > "${filename}.fullname"
+                 ;;
+            b|B) mv "${filename}"          "${filename}.${d}"
+                 mv "${f}.description"     "${f}.description.${d}"
+                 mv "${filename}.fullname" "${filename}.fullname.${d}"
+                 echo "${filename_full}" > "${filename}.fullname"
+                 ;;
+            p|P) if [ -z "${4}" ];then
+                     # в отдельном окне, но без pipe
+                     setsid mpv --cache=yes "${filename}" > /dev/null 2>&1 &
+                 elif [ -p "${4}" ];then
+                     # в отдельном окне, но с pipe
+                     echo 'no_play://' > "${4}"
+                     setsid mpv --cache=yes "${filename}" > /dev/null 2>&1 &
+                 else
+                     # в одном процессе
+                     eval "${4}='no_play://'"
+                     setsid mpv --cache=yes "${filename}"
+                 fi
+                 ;;
+            *) REPLY=n
+               ;;
+        esac
+        echo ''
+    fi
+
+    
+    if [[ p${REPLY} != p[pP] ]];then
+        if [ n${REPLY} != nn ];then
+            youtube-dl -f ${1} --write-description -o "${filename}" "${2}"
+            rcode=$?
+        fi
+        
+        if [ ${rcode} = 0 ]; then
+            if [ -n "${4}" ];then
+                if [ -p "${4}" ];then
+                    echo "play://${filename}" > "${4}"
+                else
+                    eval "${4}=\"play://${filename}\""
+                fi
+            fi
+            rcode=0
+        else
+            printf '\nAborting\n'
+            if [ -n "${4}" ];then
+                if [ -p "${4}" ];then
+                    echo ''  > "${4}"
+                else
+                    eval "${4}=''"
+                fi
+            fi
+            rcode=1
+        fi
+    fi
+    if [ w${3} = wwait ] || [ d${3} = ddefault-wait ];then
+        echo 'End (press Enter).'
+        read -s -n 1000000
+    fi
+    return ${rcode}
+
+}
+export -f em_save_video2file
+
+
+##.=======================================================================.
+##! \brief Fetching available formats for the URL.
+##!
+##! \param $1 - web page url;
+##! \param $2 - path to named pipe;
+##!
+##! \return - 0: the desired quality code has been selected.
+##|
+##'======================================================================='
+em_get_format () {
+
+    logger -p local2.info -t "${SN}" "em_get_format: In"
+
+    local out
+    local prompt
+    local rcode
+    
+    echo "Fetching available formats for \"${1}\"..."
+    youtube-dl -F "${1}"
+
+    prompt="Please enter the desired quality code: "
+    if [ -p "${2}" ];then
+        # https://superuser.com/questions/1267984/how-to-exit-read-bash-builtin-by-pressing-the-esc-key
+        set -o emacs
+        bind '"\C-w": kill-whole-line'
+        bind '"\e": "\C-w\C-d"'
+        bind '"\e\e": "\C-w\C-d"'
+        bind '"\e\e\e": "\C-w\C-d"'
+        prompt="Please enter the desired quality code (ESC to exit): "
+    fi
+    
+    IFS= read -rep "${prompt}" REPLY
+    rcode=$?
+
+    case "${rcode}" in
+        0) if [ -p "${2}" ];then
+               echo "${REPLY}" > "${2}"
+           else
+               eval "${2}=\"${REPLY}\""
+           fi
+           return 0
+           ;;
+        1) em_send_quit "${2}" # получен Ctrl-D
+           return 1
+           ;;
+        *) return 2
+           ;;
+    esac
+}
+export -f em_get_format
+
+
+
+##.=======================================================================.
+##! \brief Find your preferred video format.
+##!
+##! \param $1 - web page url;
+##! \param $2 - preferred video format.
+##!
+##! \return - 0: the desired quality code has been matched.
+##|
+##'======================================================================='
+em_test_prefer_format () {
+
+    local flpref=
+
+    while IFS= read -r str; do
+        if [ -n "$(echo ${str}|grep "^${2} ")" ]; then
+            flpref=yes
+            break
+        fi
+    done <<< $(youtube-dl -F "${1}")
+
+
+    if [ y${flpref} = yyes ];then
+        return 0
+    else
+        return 1
+    fi
+}
+export -f em_test_prefer_format
+
+
+##.=======================================================================.
+##! \brief Trap SIGHUP
+##!
+##! \param $1 - path to named pipe.
+##|
+##'======================================================================='
+em_trap_1 () {
+    [ -p "${1}" ] && echo 'signal://SIGHUP' > "${1}"
+    printf '\n\nAborting\n'
+    sleep 1
+    trap - 1
+    exit
+}
+export -f em_trap_1
+
+
+##.=======================================================================.
+##! \brief Trap SIGINT (ctrl-c)
+##!
+##! \param $1 - path to named pipe.
+##|
+##'======================================================================='
+em_trap_2 () {
+    [ -p "${1}" ] && echo 'signal://SIGINT' > "${1}"
+    printf '\n\nAborting\n'
+    sleep 1
+    trap - 2
+    exit
+}
+export -f em_trap_2
+
+
+##.=======================================================================.
+##! \brief Trap SIGTERM
+##!
+##! \param $1 - path to named pipe.
+##|
+##'======================================================================='
+em_trap_15 () {
+    [ -p "${1}" ] && echo 'signal://SIGTERM' > "${1}"
+    printf '\n\nExit\n'
+    sleep 1
+    trap - 15
+    exit
+}
+export -f em_trap_15
+
+
+em_trap () {
+    trap "em_trap_1 ${1}"   1
+    trap "em_trap_2 ${1}"   2
+    trap "em_trap_15 ${1}" 15
+}
+export -f em_trap
+
+
+EM_PPID=${$}
+EM_TMPDIR=/tmp/em-xsel-youtube-dl
+EM_PIPE_PATH="${EM_TMPDIR}/${EM_PPID}"
+EM_PIPE=
+
+DATE_FORMAT="%Y%m%d%H%M%S"
+EM_DATE=$(date "+$DATE_FORMAT")
+
+EM_SAVE=
+EM_SAVE_DIR="${HOME}/em_youtube_dl"
+EM_XSEL=
+EM_FORMAT=18
+EM_Win=
+EM_NP=
+EM_F=
+EM_WMCTRL_ARGS=
+EM_PAGE_URL=
+EM_VIDEO_URL=
+EM_PLAY_SAVED=
+
+EM_SAVE_THEN_PLAY=
+export EM_SAVE_THEN_PLAY
+
+while [ $# -ne 0 ]
+do
+    case "$1" in
+        --save|-s)      EM_SAVE=yes;;
+        --save-wait)    EM_SAVE=wait;;
+        --save-default) EM_SAVE=default;;
+        --save-default-wait) EM_SAVE=default-wait;;
+        --save-then-play)    EM_SAVE_THEN_PLAY=yes;;
+        --dir|-d)       EM_SAVE_DIR=${1};;
+        --use-xsel|-x)  EM_XSEL=yes;;
+        --win|-w)       EM_WIN=yes;;
+        --format|-f)    shift;EM_FORMAT=${1};;
+        --interact|-i)  EM_FORMAT=;;
+        --no-play|-N)   EM_NP=yes;;
+        --above|-A)     EM_WMCTRL_ARGS="${EM_WMCTRL_ARGS},above";;
+        --sticky|-S)    EM_WMCTRL_ARGS="${EM_WMCTRL_ARGS},sticky";;
+        --help|-h)      help_message; exit 0;;
+        -*)             EM_OPT_ERROR=${1};break;;
+        *) EM_PAGE_URL=${1};;
+    esac
+    shift
+done
+
+if [ -n "${EM_OPT_ERROR}" ];then
+    echo
+    help_message
+    echo;echo "***Error: ${EM_OPT_ERROR} : no such option.";echo
+    exit 1
+fi
+
+if [ y${EM_SAVE_THEN_PLAY} = yyes ];then
+    [ -z "${EM_SAVE}" ] && EM_SAVE=default
+fi
+
+if [ y${EM_XSEL} = yyes ];then
+    if  type xsel > /dev/null 2>&1;then
+        EM_PAGE_URL=$(xsel -p -o)
+    else
+        echo;echo "***Error: xsel : no such command.";echo
+        exit 1
+    fi
+fi
+
+
+if [ -n "${EM_FORMAT}" ] && em_test_prefer_format "${EM_PAGE_URL}" "${EM_FORMAT}";then
+
+    EM_F=${EM_FORMAT}    
+
+    # Get the actual url of video and audio stream.
+    EM_VIDEO_URL=$(youtube-dl -f ${EM_FORMAT} -g "${EM_PAGE_URL}")
+
+else
+    if [ -n "${EM_WIN}" ];then
+
+        EM_PIPE="${EM_PIPE_PATH}"
+        mkdir -p "${EM_TMPDIR}"; mkfifo "${EM_PIPE}"
+
+        xterm -g "=120x25" -title "Get quality code for ${EM_PAGE_URL}" \
+              -e "sh -c \"em_trap '${EM_PIPE}';em_get_format '${EM_PAGE_URL}' '${EM_PIPE}'\"" \
+              > /dev/null 2>&1 &
+
+        if [ -p "${EM_PIPE}" ];then
+            EM_F=$(cat "${EM_PIPE}")
+            rm "${EM_PIPE}";EM_PIPE=
+        fi
+    else
+        em_get_format "${EM_PAGE_URL}" EM_F
+    fi
+
+    # принят один из сигналов аварийного завершения от xterm
+    [ -n "$(echo "${EM_F}"|grep '^signal://')" ] && exit 1
+
+    # Get the actual url of video and audio stream.
+    EM_VIDEO_URL=$(youtube-dl -f ${EM_F} -g "${EM_PAGE_URL}")
+fi
+
+
+# Сохранить
+if [ y${EM_SAVE} = yyes ] || [ d${EM_SAVE} = ddefault ] ||\
+       [ w${EM_SAVE} = wwait ] || [ d${EM_SAVE} = ddefault-wait ];then
+
+    # переместимся в катаог, где сохнаняются файлы.
+    mkdir -p "${EM_SAVE_DIR}"; cd "${EM_SAVE_DIR}"
+
+    if [ -n "${EM_WIN}" ];then
+
+        if [ y${EM_SAVE_THEN_PLAY} = yyes ];then
+            EM_PIPE="${EM_PIPE_PATH}"
+            mkdir -p "${EM_TMPDIR}"; mkfifo "${EM_PIPE}"
+        fi
+
+        xterm -g "=77x20" -title "Save to file ${EM_PAGE_URL}" \
+              -e "sh -c \"em_trap '${EM_PIPE}';em_save_video2file '${EM_F}' '${EM_PAGE_URL}' '${EM_SAVE}' '${EM_PIPE}'\"" \
+              > /dev/null 2>&1 &
+
+        # если pipe, то будем ждать.
+        if [ -p "${EM_PIPE}" ];then
+            EM_VIDEO_URL=$(cat "${EM_PIPE}")
+            rm "${EM_PIPE}"; EM_PIPE=
+        fi
+    else
+        em_save_video2file "${EM_F}" "${EM_PAGE_URL}" ${EM_SAVE} EM_VIDEO_URL
+    fi
+
+    # принят один из сигналов аварийного завершения от xterm
+    [ -n "$(echo "${EM_VIDEO_URL}"|grep '^signal://')" ] && exit 1
+
+    if [ -n "$(echo "${EM_VIDEO_URL}"|grep '^no_play://')" ];then
+        EM_VIDEO_URL=
+    else
+        EM_VIDEO_URL="$(echo "${EM_VIDEO_URL}"|sed 's/^play:\/\/\(.*\)$/\1/g')"
+    fi
+fi
+
+
+# Показать
+if [ -n "${EM_VIDEO_URL}" ]; then
+
+    if [ ! y${EM_NP} = yyes ];then
+        #mplayer -zoom -xy 640 -cache 30720 -cache-min 2 "ffmpeg://${EM_VIDEO_URL}" >/dev/null 2>&1
+        # https://ubuntuforums.org/showthread.php?t=2382318
+        if [ -z "${EM_WIN}" ];then
+            setsid mpv --cache=yes "${EM_VIDEO_URL}"
+        else
+            setsid mpv --cache=yes "${EM_VIDEO_URL}" &
+            PID=$!
+
+            logger -p local2.info -t `basename $0` "EM_WMCTRL_ARGS=>${EM_WMCTRL_ARGS}<"
+            if type  wmctrl > /dev/null 2>&1;then
+                if [ -n "${EM_WMCTRL_ARGS}" ];then
+                    sleep 2
+                    for i in $(seq 11); do
+                        WINID=$(wmctrl -lp|grep $PID|cut -d' ' -sf1)
+                        logger -p local2.info -t `basename $0` "${i} WINID=>${WINID}<"
+
+                        if [ -z "${WINID}" ];then
+                            type  notify-send > /dev/null 2>&1 && \
+                                notify-send -t 7000 \
+                                            "${SN}" 'Window not found! ${i}' \
+                                            -u normal -i face-worried
+                            sleep 1
+                        else
+                            wmctrl -ir ${WINID} -b toggle${EM_WMCTRL_ARGS}
+                            #wmctrl -ir ${WINID} -b toggle,skip_taskbar,skip_pager
+                            break
+                        fi
+                    done
+                fi
+            fi
+        fi
+    fi
+fi
